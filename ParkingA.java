@@ -1,238 +1,441 @@
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
+import java.security.spec.*;
 import java.time.*;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
- 
+
 public class ParkingA {
-    // Shared data and rules are identical in all versions.
-    record User(String salt, String hash, long balance) {}
-    record Session(String owner, String plate, int zone, long start, long end) {}
-    record Receipt(String owner, String session, String kind, long amount,
-                   long time, long expiry) {}
-    static class Data {
-        Map<String, User> users = new LinkedHashMap<>();
-        Map<String, String> vehicles = new LinkedHashMap<>();
-        Map<String, Session> sessions = new LinkedHashMap<>();
-        Map<String, Receipt> receipts = new LinkedHashMap<>();
+    static final String DATA_FILE = "flexi_data.tsv";
+    static final DateTimeFormatter DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.of("Asia/Kuala_Lumpur"));
+    static final int PBKDF2_ITER = 120000;
+    static final int SALT_LEN = 16;
+    static final int HASH_LEN = 32;
+    static final long MAX_WALLET_SEN = 1000000L; // RM10,000
+
+    // ---------- Data records ----------
+    static class User {
+        String username; String saltHex; String hashHex; long balanceSen;
+        User() {}
+        User(String u, String s, String h, long b) { username=u; saltHex=s; hashHex=h; balanceSen=b; }
     }
-    static final String[] ZONES = {"Kajang Sample A", "Kajang Sample B"};
-    static final long[] RATES = {60, 120}; // sen per hour; sample rates
-    static final long MAX_BALANCE = 1000000; // RM10,000
-    static final Scanner IN = new Scanner(System.in);
-    static String ask(String label) {
-        System.out.print(label + ": ");
-        if (!IN.hasNextLine()) throw new NoSuchElementException();
-        return IN.nextLine().trim();
-    }
-    static void require(boolean ok, String message) {
-        if (!ok) throw new IllegalArgumentException(message);
-    }
-    static int number(String text) {
-        try { return Integer.parseInt(text); }
-        catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Enter a whole number.");
+    static class Session {
+        String id; String plate; String location; long startMs; long expiryMs; int totalMinutes; String username;
+        Session() {}
+        Session(String id, String plate, String loc, long st, long ex, int mins, String user) {
+            this.id=id; this.plate=plate; this.location=loc; this.startMs=st; this.expiryMs=ex; this.totalMinutes=mins; this.username=user;
         }
     }
-    static int minutes(String text) {
-        int value = number(text);
-        require(value >= 30 && value <= 480 && value % 30 == 0,
-                "Duration must be 30 to 480 minutes in steps of 30.");
-        return value;
+    static class Receipt {
+        String id; String type; long amountSen; String sessionId; long payMs; long expiryMs; String username;
+        Receipt() {}
+        Receipt(String id, String type, long amt, String sid, long pay, long exp, String user) {
+            this.id=id; this.type=type; this.amountSen=amt; this.sessionId=sid; this.payMs=pay; this.expiryMs=exp; this.username=user;
+        }
     }
-    static long money(String text) {
-        require(text.matches("[0-9]{1,5}(\\.[0-9]{1,2})?"),
-                "Use a positive RM amount with at most 2 decimal places.");
-        long value = new java.math.BigDecimal(text).movePointRight(2).longValueExact();
-        require(value > 0 && value <= MAX_BALANCE, "Reload must be RM0.01 to RM10,000.");
-        return value;
+
+    // ---------- Data container ----------
+    static class Data {
+        Map<String,User> users = new LinkedHashMap<>();
+        Map<String,String> vehicles = new LinkedHashMap<>(); // plate -> username
+        List<Session> sessions = new ArrayList<>();
+        List<Receipt> receipts = new ArrayList<>();
     }
-    static String rm(long sen) { return String.format(Locale.ROOT, "RM%d.%02d", sen / 100, sen % 100); }
-    static String username(String text) {
-        String name = text.toLowerCase(Locale.ROOT);
-        require(name.matches("[a-z0-9_]{3,20}"), "Username: 3-20 letters, digits or underscore.");
-        return name;
-    }
-    static String plate(String text) {
-        String p = text.replace(" ", "").toUpperCase(Locale.ROOT);
-        require(p.matches("[A-Z0-9]{2,12}"), "Plate: 2-12 letters or digits.");
-        return p;
-    }
-    static String hash(String password, String salt) {
-        try {
-            PBEKeySpec spec = new PBEKeySpec(password.toCharArray(),
-                    HexFormat.of().parseHex(salt), 120000, 256);
-            byte[] result = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-                    .generateSecret(spec).getEncoded();
-            spec.clearPassword();
-            return HexFormat.of().formatHex(result);
-        } catch (GeneralSecurityException e) { throw new IllegalStateException(e); }
-    }
-    static User newUser(String password) {
-        require(password.length() >= 8 && password.length() <= 128,
-                "Password: 8-128 characters.");
-        byte[] bytes = new byte[16]; new SecureRandom().nextBytes(bytes);
-        String salt = HexFormat.of().formatHex(bytes);
-        return new User(salt, hash(password, salt), 0);
-    }
-    static long now() { return Clock.systemUTC().millis(); }
-    static String id() { return UUID.randomUUID().toString(); }
-    static String date(long time) {
-        return Instant.ofEpochMilli(time).atZone(ZoneId.of("Asia/Kuala_Lumpur")).toString();
-    }
-    static String receipt(String id, Receipt r) {
-        return "Receipt " + id + " | " + r.kind() + " | " + rm(r.amount())
-                + " | Session " + r.session() + " | " + date(r.time())
-                + " | Expiry " + date(r.expiry());
-    }
+
+    // ---------- Store ----------
     static class Store {
-        final Path path;
-        Store(String file) { path = Path.of(file).toAbsolutePath(); }
-        Data load() throws IOException {
+        static Data load() {
             Data d = new Data();
-            if (!Files.exists(path)) return d;
-            List<String> lines = Files.readAllLines(path);
-            if (lines.isEmpty() || !lines.get(0).equals("FLEXI1"))
-                throw new IOException("Invalid data file; restore a backup.");
+            Path p = Paths.get(DATA_FILE);
+            if (!Files.exists(p)) return d;
             try {
-                for (String line : lines.subList(1, lines.size())) {
-                    String[] p = line.split("\\t", -1);
-                    switch (p[0]) {
-                        case "U" -> d.users.put(p[1], new User(p[2], p[3], Long.parseLong(p[4])));
-                        case "V" -> d.vehicles.put(p[1], p[2]);
-                        case "S" -> d.sessions.put(p[1], new Session(p[2], p[3],
-                                Integer.parseInt(p[4]), Long.parseLong(p[5]), Long.parseLong(p[6])));
-                        case "R" -> d.receipts.put(p[1], new Receipt(p[2], p[3], p[4],
-                                Long.parseLong(p[5]), Long.parseLong(p[6]), Long.parseLong(p[7])));
-                        default -> throw new IllegalArgumentException();
+                List<String> lines = Files.readAllLines(p, StandardCharsets.UTF_8);
+                for (String line : lines) {
+                    if (line.isEmpty()) continue;
+                    String[] f = line.split("\t", -1);
+                    if (f.length == 0) continue;
+                    switch (f[0]) {
+                        case "USER":
+                            if (f.length >= 5) {
+                                d.users.put(f[1], new User(f[1], f[2], f[3], Long.parseLong(f[4])));
+                            }
+                            break;
+                        case "VEHICLE":
+                            if (f.length >= 3) d.vehicles.put(f[1], f[2]);
+                            break;
+                        case "SESSION":
+                            if (f.length >= 8) {
+                                d.sessions.add(new Session(f[1], f[2], f[3], Long.parseLong(f[4]), Long.parseLong(f[5]), Integer.parseInt(f[6]), f[7]));
+                            }
+                            break;
+                        case "RECEIPT":
+                            if (f.length >= 8) {
+                                d.receipts.add(new Receipt(f[1], f[2], Long.parseLong(f[3]), f[4], Long.parseLong(f[5]), Long.parseLong(f[6]), f[7]));
+                            }
+                            break;
                     }
                 }
-            } catch (RuntimeException e) { throw new IOException("Invalid data file; restore a backup.", e); }
+            } catch (Exception e) {
+                System.err.println("Storage load error: " + e.getMessage());
+                System.exit(1);
+            }
             return d;
         }
-        void save(Data d) throws IOException {
-            List<String> lines = new ArrayList<>(); lines.add("FLEXI1");
-            d.users.forEach((k, u) -> lines.add(String.join("\t", "U", k, u.salt(), u.hash(), "" + u.balance())));
-            d.vehicles.forEach((p, u) -> lines.add(String.join("\t", "V", p, u)));
-            d.sessions.forEach((k, s) -> lines.add(String.join("\t", "S", k, s.owner(), s.plate(),
-                    "" + s.zone(), "" + s.start(), "" + s.end())));
-            d.receipts.forEach((k, r) -> lines.add(String.join("\t", "R", k, r.owner(), r.session(),
-                    r.kind(), "" + r.amount(), "" + r.time(), "" + r.expiry())));
-            Path temp = Files.createTempFile(path.getParent(), "flexi-", ".tmp");
+
+        static boolean save(Data d) {
+            Path p = Paths.get(DATA_FILE);
+            Path tmp = Paths.get(DATA_FILE + ".tmp");
             try {
-                Files.write(temp, lines);
-                Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } finally { Files.deleteIfExists(temp); }
+                StringBuilder sb = new StringBuilder();
+                for (User u : d.users.values()) {
+                    sb.append("USER\t").append(u.username).append("\t").append(u.saltHex).append("\t").append(u.hashHex).append("\t").append(u.balanceSen).append("\n");
+                }
+                for (Map.Entry<String,String> e : d.vehicles.entrySet()) {
+                    sb.append("VEHICLE\t").append(e.getKey()).append("\t").append(e.getValue()).append("\n");
+                }
+                for (Session s : d.sessions) {
+                    sb.append("SESSION\t").append(s.id).append("\t").append(s.plate).append("\t").append(s.location).append("\t")
+                      .append(s.startMs).append("\t").append(s.expiryMs).append("\t").append(s.totalMinutes).append("\t").append(s.username).append("\n");
+                }
+                for (Receipt r : d.receipts) {
+                    sb.append("RECEIPT\t").append(r.id).append("\t").append(r.type).append("\t").append(r.amountSen).append("\t")
+                      .append(r.sessionId).append("\t").append(r.payMs).append("\t").append(r.expiryMs).append("\t").append(r.username).append("\n");
+                }
+                Files.write(tmp, sb.toString().getBytes(StandardCharsets.UTF_8));
+                try {
+                    Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return true;
+            } catch (Exception e) {
+                System.err.println("Storage save error: " + e.getMessage());
+                try { Files.deleteIfExists(tmp); } catch (Exception ignored) {}
+                return false;
+            }
         }
     }
-    public static void main(String[] args) throws Exception {
-        Store store = new Store(args.length == 0 ? "parking-a.tsv" : args[0]);
-        String current = null;
-        while (true) {
-            try {
-                Data d = store.load(); // fresh candidate; failed saves are discarded
-                if (current == null) {
-                    System.out.println("1 Register | 2 Login | 0 Exit");
-                    String choice = ask("Choice");
-                    if (choice.equals("0")) return;
-                    require(choice.equals("1") || choice.equals("2"), "Invalid option.");
-                    String name = username(ask("Username"));
-                    String password = ask("Password");
-                    if (choice.equals("1")) {
-                        require(!d.users.containsKey(name), "Username already exists.");
-                        d.users.put(name, newUser(password)); store.save(d);
-                        System.out.println("Account saved. Please log in.");
-                    } else {
-                        User u = d.users.get(name);
-                        require(u != null && hash(password, u.salt()).equals(u.hash()), "Invalid credentials.");
-                        current = name;
-                        System.out.println("Welcome " + current);
-                    }
-                    continue;
-                }
-                User u = d.users.get(current);
-                System.out.println("User " + current + " | Balance " + rm(u.balance()));
-                System.out.println("1 Add vehicle | 2 Vehicles | 3 Reload | 4 Park");
-                System.out.println("5 Sessions | 6 Extend | 7 History | 8 Logout | 0 Exit");
-                String choice = ask("Choice");
-                if (choice.equals("0")) return;
-                if (choice.equals("8")) { current = null; continue; }
-                if (choice.equals("1")) {
-                    String p = plate(ask("Plate"));
-                    require(!d.vehicles.containsKey(p), "Plate already registered.");
-                    d.vehicles.put(p, current); store.save(d);
-                    System.out.println("Vehicle saved.");
-                } else if (choice.equals("2")) {
-                    for (var v : d.vehicles.entrySet())
-                        if (v.getValue().equals(current)) System.out.println(v.getKey());
-                } else if (choice.equals("3")) {
-                    long amount = money(ask("Reload RM"));
-                    require(u.balance() + amount <= MAX_BALANCE, "Wallet limit is RM10,000.");
-                    d.users.put(current, new User(u.salt(), u.hash(), u.balance() + amount));
-                    store.save(d); System.out.println("Reload saved.");
-                } else if (choice.equals("4")) {
-                    for (var v : d.vehicles.entrySet())
-                        if (v.getValue().equals(current)) System.out.println(v.getKey());
-                    String p = plate(ask("Select plate"));
-                    require(current.equals(d.vehicles.get(p)), "Select your registered vehicle.");
-                    for (int i = 0; i < ZONES.length; i++)
-                        System.out.println((i + 1) + " " + ZONES[i] + " " + rm(RATES[i]) + "/hour");
-                    int z = number(ask("Zone")) - 1;
-                    require(z >= 0 && z < ZONES.length, "Invalid zone.");
-                    int m = minutes(ask("Minutes (60 = 1 hour)"));
-                    long fee = RATES[z] * m / 60;
-                    System.out.println("Fee " + rm(fee));
-                    if (!ask("Pay? Y/N").equalsIgnoreCase("Y")) continue;
-                    long time = now();
-                    for (Session s : d.sessions.values())
-                        require(!s.plate().equals(p) || s.end() <= time, "Vehicle already has active parking.");
-                    require(u.balance() >= fee, "Insufficient balance.");
-                    String sid = id(), rid = id();
-                    Session session = new Session(current, p, z, time, time + m * 60000L);
-                    d.users.put(current, new User(u.salt(), u.hash(), u.balance() - fee));
-                    d.sessions.put(sid, session);
-                    Receipt r = new Receipt(current, sid, "PARK", fee, time, session.end());
-                    d.receipts.put(rid, r); store.save(d);
-                    System.out.println(receipt(rid, r));
-                } else if (choice.equals("5")) {
-                    for (var e : d.sessions.entrySet()) {
-                        Session s = e.getValue();
-                        if (s.owner().equals(current)) System.out.println(e.getKey() + " | " + s.plate()
-                                + " | " + ZONES[s.zone()] + " | " + date(s.start()) + " -> " + date(s.end())
-                                + " | " + (s.end() > now() ? "ACTIVE" : "EXPIRED"));
-                    }
-                } else if (choice.equals("6")) {
-                    String sid = ask("Session ID (see Sessions)");
-                    Session s = d.sessions.get(sid);
-                    require(s != null && s.owner().equals(current), "Session not found.");
-                    int m = minutes(ask("Extra minutes"));
-                    long end = s.end() + m * 60000L;
-                    require(end - s.start() <= 480 * 60000L, "Total session limit is 480 minutes.");
-                    long fee = RATES[s.zone()] * m / 60;
-                    System.out.println("Fee " + rm(fee));
-                    if (!ask("Pay? Y/N").equalsIgnoreCase("Y")) continue;
-                    long time = now();
-                    require(s.end() > time, "Session expired; start new parking.");
-                    require(u.balance() >= fee, "Insufficient balance.");
-                    d.users.put(current, new User(u.salt(), u.hash(), u.balance() - fee));
-                    d.sessions.put(sid, new Session(current, s.plate(), s.zone(), s.start(), end));
-                    String rid = id();
-                    Receipt r = new Receipt(current, sid, "EXTEND", fee, time, end);
-                    d.receipts.put(rid, r); store.save(d);
-                    System.out.println(receipt(rid, r));
-                } else if (choice.equals("7")) {
-                    boolean found = false;
-                    for (var e : d.receipts.entrySet()) if (e.getValue().owner().equals(current)) {
-                        found = true; System.out.println(receipt(e.getKey(), e.getValue()));
-                    }
-                    if (!found) System.out.println("No payments yet.");
-                } else throw new IllegalArgumentException("Invalid option.");
-            } catch (IllegalArgumentException e) { System.out.println("Error: " + e.getMessage()); }
-            catch (IOException e) { System.out.println("Storage error; operation not confirmed: " + e.getMessage()); return; }
-            catch (NoSuchElementException e) { return; }
+
+    // ---------- Crypto helpers ----------
+    static String bytesToHex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format("%02x", x));
+        return sb.toString();
+    }
+    static byte[] hexToBytes(String s) {
+        byte[] out = new byte[s.length()/2];
+        for (int i=0;i<out.length;i++) out[i] = (byte)Integer.parseInt(s.substring(i*2,i*2+2),16);
+        return out;
+    }
+    static byte[] randomSalt() {
+        byte[] s = new byte[SALT_LEN];
+        new SecureRandom().nextBytes(s);
+        return s;
+    }
+    static byte[] pbkdf2(char[] password, byte[] salt, int iter, int len) {
+        try {
+            PBEKeySpec spec = new PBEKeySpec(password, salt, iter, len*8);
+            SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            return f.generateSecret(spec).getEncoded();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
+    }
+
+    // ---------- Utility ----------
+    static Scanner sc = new Scanner(System.in);
+    static String readLine(String prompt) {
+        System.out.print(prompt);
+        String s = sc.nextLine();
+        return s == null ? "" : s.trim();
+    }
+    static long parseSen(String s) {
+        try {
+            double d = Double.parseDouble(s);
+            if (d < 0) return -1;
+            return Math.round(d * 100.0);
+        } catch (Exception e) { return -1; }
+    }
+    static String senToRm(long sen) {
+        return String.format("RM%.2f", sen / 100.0);
+    }
+    static String nowStr(long ms) { return DT_FMT.format(Instant.ofEpochMilli(ms)); }
+    static String genId(String prefix) {
+        return prefix + "-" + Long.toString(System.currentTimeMillis(), 36) + "-" + Integer.toString(new Random().nextInt(9999), 36);
+    }
+    static boolean validUsername(String u) {
+        return u.matches("[A-Za-z0-9_]{3,20}");
+    }
+    static boolean validPlate(String p) {
+        return p.matches("[A-Z0-9]{2,12}");
+    }
+    static void waitEnter() { readLine("Press Enter to continue..."); }
+
+    // ---------- Main ----------
+    public static void main(String[] args) {
+        while (true) {
+            System.out.println("\n=== Flexi Parking (A) ===");
+            System.out.println("1. Register");
+            System.out.println("2. Login");
+            System.out.println("3. Exit");
+            String c = readLine("Choose: ");
+            if (c.equals("1")) doRegister();
+            else if (c.equals("2")) doLogin();
+            else if (c.equals("3")) { System.out.println("Bye."); return; }
+            else System.out.println("Invalid choice.");
+        }
+    }
+
+    static void doRegister() {
+        Data d = Store.load();
+        String uname = readLine("Username (3-20 letters/digits/_): ").toLowerCase();
+        if (!validUsername(uname)) { System.out.println("Invalid username."); return; }
+        if (d.users.containsKey(uname)) { System.out.println("Username already taken."); return; }
+        String pass = readLine("Password (8-128 chars): ");
+        if (pass.length() < 8 || pass.length() > 128) { System.out.println("Invalid password length."); return; }
+        byte[] salt = randomSalt();
+        byte[] hash = pbkdf2(pass.toCharArray(), salt, PBKDF2_ITER, HASH_LEN);
+        User u = new User(uname, bytesToHex(salt), bytesToHex(hash), 0L);
+        d.users.put(uname, u);
+        if (Store.save(d)) System.out.println("Registered. Please login.");
+        else { System.out.println("Registration failed due to storage error."); }
+    }
+
+    static void doLogin() {
+        Data d = Store.load();
+        String uname = readLine("Username: ").toLowerCase();
+        User u = d.users.get(uname);
+        if (u == null) { System.out.println("Invalid username or password."); return; }
+        String pass = readLine("Password: ");
+        byte[] salt = hexToBytes(u.saltHex);
+        byte[] hash = pbkdf2(pass.toCharArray(), salt, PBKDF2_ITER, HASH_LEN);
+        if (!bytesToHex(hash).equals(u.hashHex)) { System.out.println("Invalid username or password."); return; }
+        System.out.println("Welcome, " + u.username + "!");
+        userMenu(u.username);
+    }
+
+    static void userMenu(String username) {
+        while (true) {
+            Data d = Store.load();
+            User u = d.users.get(username);
+            if (u == null) { System.out.println("Account not found."); return; }
+            System.out.println("\n=== Menu (" + username + ") ===");
+            System.out.println("Balance: " + senToRm(u.balanceSen));
+            System.out.println("1. Vehicles");
+            System.out.println("2. Reload");
+            System.out.println("3. Park");
+            System.out.println("4. Sessions");
+            System.out.println("5. Extend");
+            System.out.println("6. History");
+            System.out.println("7. Logout");
+            System.out.println("8. Exit");
+            String c = readLine("Choose: ");
+            try {
+                switch (c) {
+                    case "1": vehicleMenu(username); break;
+                    case "2": reload(username); break;
+                    case "3": park(username); break;
+                    case "4": showSessions(username); break;
+                    case "5": extend(username); break;
+                    case "6": showHistory(username); break;
+                    case "7": return;
+                    case "8": System.out.println("Bye."); System.exit(0);
+                    default: System.out.println("Invalid choice.");
+                }
+            } catch (Exception e) {
+                System.out.println("Error: " + e.getMessage());
+            }
+        }
+    }
+
+    static void vehicleMenu(String username) {
+        while (true) {
+            Data d = Store.load();
+            System.out.println("\n--- Vehicles ---");
+            List<String> mine = new ArrayList<>();
+            for (Map.Entry<String,String> e : d.vehicles.entrySet())
+                if (e.getValue().equals(username)) mine.add(e.getKey());
+            if (mine.isEmpty()) System.out.println("(none)");
+            else for (String p : mine) System.out.println("  " + p);
+            System.out.println("1. Add vehicle");
+            System.out.println("2. Back");
+            String c = readLine("Choose: ");
+            if (c.equals("2")) return;
+            if (c.equals("1")) {
+                String plate = readLine("Number plate: ").replaceAll("\\s+", "").toUpperCase();
+                if (!validPlate(plate)) { System.out.println("Invalid plate (2-12 letters/digits)."); continue; }
+                if (d.vehicles.containsKey(plate)) { System.out.println("Plate already registered."); continue; }
+                d.vehicles.put(plate, username);
+                if (Store.save(d)) System.out.println("Vehicle added.");
+                else System.out.println("Storage error; not saved.");
+            }
+        }
+    }
+
+    static void reload(String username) {
+        Data d = Store.load();
+        User u = d.users.get(username);
+        String s = readLine("Reload amount RM (max 2 decimals): ");
+        if (!s.matches("\\d+(\\.\\d{1,2})?")) { System.out.println("Invalid amount."); return; }
+        long sen = parseSen(s);
+        if (sen <= 0) { System.out.println("Amount must be positive."); return; }
+        if (u.balanceSen + sen > MAX_WALLET_SEN) { System.out.println("Exceeds max balance RM10,000."); return; }
+        u.balanceSen += sen;
+        if (Store.save(d)) System.out.println("Reloaded. New balance: " + senToRm(u.balanceSen));
+        else System.out.println("Storage error; reload not saved.");
+    }
+
+    static void park(String username) {
+        Data d = Store.load();
+        User u = d.users.get(username);
+        List<String> mine = new ArrayList<>();
+        for (Map.Entry<String,String> e : d.vehicles.entrySet())
+            if (e.getValue().equals(username)) mine.add(e.getKey());
+        if (mine.isEmpty()) { System.out.println("No vehicles. Add one first."); return; }
+
+        System.out.println("Your vehicles:");
+        for (int i=0;i<mine.size();i++) System.out.println((i+1)+". "+mine.get(i));
+        String ps = readLine("Select vehicle #: ");
+        int pi;
+        try { pi = Integer.parseInt(ps) - 1; } catch (Exception e) { System.out.println("Invalid."); return; }
+        if (pi < 0 || pi >= mine.size()) { System.out.println("Invalid."); return; }
+        String plate = mine.get(pi);
+
+        for (Session s : d.sessions) {
+            if (s.plate.equals(plate) && s.expiryMs > System.currentTimeMillis()) {
+                System.out.println("This vehicle already has an active session."); return;
+            }
+        }
+
+        System.out.println("1. Kajang Sample A - RM0.60/hour");
+        System.out.println("2. Kajang Sample B - RM1.20/hour");
+        String ls = readLine("Select location: ");
+        String loc; long rateSen;
+        if (ls.equals("1")) { loc = "Kajang Sample A"; rateSen = 60; }
+        else if (ls.equals("2")) { loc = "Kajang Sample B"; rateSen = 120; }
+        else { System.out.println("Invalid location."); return; }
+
+        String ds = readLine("Duration minutes (30-480, multiples of 30): ");
+        int mins;
+        try { mins = Integer.parseInt(ds); } catch (Exception e) { System.out.println("Invalid."); return; }
+        if (mins < 30 || mins > 480 || mins % 30 != 0) { System.out.println("Invalid duration."); return; }
+
+        long feeSen = rateSen * mins / 60; // integer sen
+        System.out.println("Fee: " + senToRm(feeSen));
+        String conf = readLine("Confirm payment? (Y/y to pay): ");
+        if (!conf.equalsIgnoreCase("y")) { System.out.println("Cancelled."); return; }
+
+        if (u.balanceSen < feeSen) { System.out.println("Insufficient balance."); return; }
+
+        long now = System.currentTimeMillis();
+        long expiry = now + mins * 60000L;
+        String sid = genId("S");
+        String rid = genId("R");
+        u.balanceSen -= feeSen;
+        d.sessions.add(new Session(sid, plate, loc, now, expiry, mins, username));
+        d.receipts.add(new Receipt(rid, "PARK", feeSen, sid, now, expiry, username));
+        if (Store.save(d)) {
+            System.out.println("Parking activated. Session: " + sid);
+            System.out.println("Receipt: " + rid + "  Start: " + nowStr(now) + "  Expiry: " + nowStr(expiry));
+            System.out.println("New balance: " + senToRm(u.balanceSen));
+        } else {
+            System.out.println("Storage error; parking not saved.");
+        }
+    }
+
+    static void showSessions(String username) {
+        Data d = Store.load();
+        long now = System.currentTimeMillis();
+        System.out.println("\n--- Active Sessions ---");
+        boolean any = false;
+        for (Session s : d.sessions) {
+            if (s.username.equals(username) && s.expiryMs > now) {
+                any = true;
+                System.out.println(s.id + " | " + s.plate + " | " + s.location + " | start " + nowStr(s.startMs) + " | expiry " + nowStr(s.expiryMs) + " | " + s.totalMinutes + " min");
+            }
+        }
+        if (!any) System.out.println("(none)");
+        System.out.println("\n--- Expired Sessions ---");
+        any = false;
+        for (Session s : d.sessions) {
+            if (s.username.equals(username) && s.expiryMs <= now) {
+                any = true;
+                System.out.println(s.id + " | " + s.plate + " | " + s.location + " | start " + nowStr(s.startMs) + " | expiry " + nowStr(s.expiryMs) + " | " + s.totalMinutes + " min");
+            }
+        }
+        if (!any) System.out.println("(none)");
+        waitEnter();
+    }
+
+    static void extend(String username) {
+        Data d = Store.load();
+        User u = d.users.get(username);
+        long now = System.currentTimeMillis();
+        List<Session> active = new ArrayList<>();
+        for (Session s : d.sessions)
+            if (s.username.equals(username) && s.expiryMs > now) active.add(s);
+        if (active.isEmpty()) { System.out.println("No active sessions."); return; }
+
+        System.out.println("Active sessions:");
+        for (int i=0;i<active.size();i++) {
+            Session s = active.get(i);
+            System.out.println((i+1)+". "+s.id+" | "+s.plate+" | "+s.location+" | expiry "+nowStr(s.expiryMs)+" | "+s.totalMinutes+" min");
+        }
+        String cs = readLine("Select session #: ");
+        int ci;
+        try { ci = Integer.parseInt(cs) - 1; } catch (Exception e) { System.out.println("Invalid."); return; }
+        if (ci < 0 || ci >= active.size()) { System.out.println("Invalid."); return; }
+        Session s = active.get(ci);
+
+        long rateSen;
+        if (s.location.equals("Kajang Sample A")) rateSen = 60;
+        else if (s.location.equals("Kajang Sample B")) rateSen = 120;
+        else { System.out.println("Unknown location."); return; }
+
+        String ds = readLine("Extra minutes (30-480, multiples of 30): ");
+        int extra;
+        try { extra = Integer.parseInt(ds); } catch (Exception e) { System.out.println("Invalid."); return; }
+        if (extra < 30 || extra > 480 || extra % 30 != 0) { System.out.println("Invalid duration."); return; }
+        if (s.totalMinutes + extra > 480) { System.out.println("Total duration would exceed 480 minutes."); return; }
+
+        long feeSen = rateSen * extra / 60;
+        System.out.println("Extension fee: " + senToRm(feeSen));
+        String conf = readLine("Confirm payment? (Y/y to pay): ");
+        if (!conf.equalsIgnoreCase("y")) { System.out.println("Cancelled."); return; }
+
+        if (u.balanceSen < feeSen) { System.out.println("Insufficient balance."); return; }
+
+        long newExpiry = s.expiryMs + extra * 60000L;
+        String rid = genId("R");
+        s.expiryMs = newExpiry;
+        s.totalMinutes += extra;
+        u.balanceSen -= feeSen;
+        d.receipts.add(new Receipt(rid, "EXTEND", feeSen, s.id, now, newExpiry, username));
+        if (Store.save(d)) {
+            System.out.println("Extended. Receipt: " + rid + "  New expiry: " + nowStr(newExpiry));
+            System.out.println("New balance: " + senToRm(u.balanceSen));
+        } else {
+            System.out.println("Storage error; extension not saved.");
+        }
+    }
+
+    static void showHistory(String username) {
+        Data d = Store.load();
+        System.out.println("\n--- Parking Payment History ---");
+        List<Receipt> list = new ArrayList<>();
+        for (Receipt r : d.receipts)
+            if (r.username.equals(username) && (r.type.equals("PARK") || r.type.equals("EXTEND"))) list.add(r);
+        list.sort(Comparator.comparingLong(r -> r.payMs));
+        if (list.isEmpty()) { System.out.println("(none)"); waitEnter(); return; }
+        System.out.printf("%-18s %-8s %-10s %-18s %-20s %-20s%n", "Receipt", "Type", "Amount", "Session", "Payment Time", "Expiry");
+        for (Receipt r : list) {
+            System.out.printf("%-18s %-8s %-10s %-18s %-20s %-20s%n",
+                r.id, r.type, senToRm(r.amountSen), r.sessionId, nowStr(r.payMs), nowStr(r.expiryMs));
+        }
+        waitEnter();
     }
 }
-
